@@ -1,19 +1,35 @@
 package sto
 
 import (
-	"sort"
+	"container/heap"
 	"sync"
 	"time"
 )
+
+type Cron struct {
+	entries   EntryHeap
+	chain     Chain
+	stop      chan struct{}
+	add       chan *Entry
+	update    chan *Entry
+	remove    chan EntryID
+	snapshot  chan chan []Entry
+	running   bool
+	runningMu sync.Mutex
+	location  *time.Location
+	nextID    EntryID
+	jobWaiter sync.WaitGroup
+}
 
 func New(opts ...Option) *Cron {
 	c := &Cron{
 		entries:   nil,
 		chain:     NewChain(),
-		add:       make(chan *Entry),
 		stop:      make(chan struct{}),
-		snapshot:  make(chan chan []Entry),
+		add:       make(chan *Entry),
+		update:    make(chan *Entry),
 		remove:    make(chan EntryID),
+		snapshot:  make(chan chan []Entry),
 		running:   false,
 		runningMu: sync.Mutex{},
 		location:  time.Local,
@@ -22,20 +38,6 @@ func New(opts ...Option) *Cron {
 		opt(c)
 	}
 	return c
-}
-
-type Cron struct {
-	entries   []*Entry
-	chain     Chain
-	stop      chan struct{}
-	add       chan *Entry
-	remove    chan EntryID
-	snapshot  chan chan []Entry
-	running   bool
-	runningMu sync.Mutex
-	location  *time.Location
-	nextID    EntryID
-	jobWaiter sync.WaitGroup
 }
 
 // now returns current time in c location
@@ -57,7 +59,6 @@ func (c *Cron) Start() {
 func (c *Cron) run() {
 	now := c.now()
 	for {
-		sort.Sort(byTime(c.entries))
 		var timer *time.Timer
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
@@ -70,30 +71,33 @@ func (c *Cron) run() {
 		for {
 			select {
 			case now = <-timer.C:
-				for len(c.entries) > 0 {
-					e := c.entries[0]
-					if e.Next.After(now) || e.Next.IsZero() {
+				for c.entries.Len() > 0 {
+					first := c.entries[0]
+					if first.Next.After(now) || first.Next.IsZero() {
 						break
 					}
-					c.entries = c.entries[1:]
-					c.startJob(e.WrappedJob, e.Payload)
+					first = heap.Pop(&c.entries).(*Entry)
+					c.startJob(first.WrappedJob, first.Payload)
 				}
 
 			case newEntry := <-c.add:
 				timer.Stop()
-				c.entries = append(c.entries, newEntry)
-
+				now = c.now()
+				heap.Push(&c.entries, newEntry)
 			case replyChan := <-c.snapshot:
 				replyChan <- c.entrySnapshot()
 				continue
 			case <-c.stop:
 				timer.Stop()
 				return
-
 			case id := <-c.remove:
 				timer.Stop()
 				now = c.now()
 				c.removeEntry(id)
+			case entry := <-c.update:
+				timer.Stop()
+				now = c.now()
+				c.updateEntry(entry)
 			}
 
 			break
@@ -113,6 +117,14 @@ func (c *Cron) Entries() []Entry {
 	return c.entrySnapshot()
 }
 
+func (c *Cron) First(fn func(payload interface{}) bool) *Entry {
+	es := c.Filter(fn)
+	if len(es) > 0 {
+		return &es[0]
+	}
+	return nil
+}
+
 func (c *Cron) Filter(fn func(payload interface{}) bool) (entrys []Entry) {
 	entries := c.Entries()
 	for _, item := range entries {
@@ -120,7 +132,6 @@ func (c *Cron) Filter(fn func(payload interface{}) bool) (entrys []Entry) {
 			entrys = append(entrys, item)
 		}
 	}
-
 	return entrys
 }
 
@@ -154,11 +165,31 @@ func (c *Cron) AddJob(next time.Time, cmd Job, payload interface{}) EntryID {
 		Payload:    payload,
 	}
 	if !c.running {
-		c.entries = append(c.entries, entry)
+		heap.Push(&c.entries, entry)
 	} else {
 		c.add <- entry
 	}
 	return entry.ID
+}
+
+func (c *Cron) UpdateFunc(id EntryID, next time.Time, cmd func(payload interface{}), payload interface{}) {
+	c.UpdateJob(id, next, FuncJob(cmd), payload)
+}
+
+func (c *Cron) UpdateJob(id EntryID, next time.Time, cmd Job, payload interface{}) {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	entry := &Entry{
+		ID:         id,
+		Next:       next,
+		WrappedJob: c.chain.Then(cmd, payload),
+		Payload:    payload,
+	}
+	if c.running {
+		c.update <- entry
+	} else {
+		c.updateEntry(entry)
+	}
 }
 
 func (c *Cron) Remove(id EntryID) {
@@ -188,30 +219,22 @@ func (c *Cron) startJob(j Job, payload interface{}) {
 }
 
 func (c *Cron) removeEntry(id EntryID) {
-	var entries []*Entry
-	for _, e := range c.entries {
-		if e.ID != id {
-			entries = append(entries, e)
+	for i, e := range c.entries {
+		if e.ID == id {
+			heap.Remove(&c.entries, i)
+			break
 		}
 	}
-	c.entries = entries
 }
 
-type byTime []*Entry
-
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
+func (c *Cron) updateEntry(entry *Entry) {
+	for i, e := range c.entries {
+		if e.ID == entry.ID {
+			c.entries[i] = entry
+			heap.Fix(&c.entries, i)
+			break
+		}
 	}
-	if s[j].Next.IsZero() {
-		return true
-	}
-	return s[i].Next.Before(s[j].Next)
 }
 
 type Job interface {
@@ -228,4 +251,21 @@ type Entry struct {
 	Next       time.Time
 	WrappedJob Job
 	Payload    interface{}
+}
+
+type EntryHeap []*Entry
+
+func (h EntryHeap) Len() int           { return len(h) }
+func (h EntryHeap) Less(i, j int) bool { return h[i].Next.Before(h[j].Next) }
+func (h EntryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *EntryHeap) Push(x interface{}) {
+
+	*h = append(*h, x.(*Entry))
+}
+func (h *EntryHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
