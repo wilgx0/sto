@@ -2,6 +2,7 @@ package sto
 
 import (
 	"container/heap"
+	"context"
 	"sync"
 	"time"
 )
@@ -15,6 +16,7 @@ type Cron struct {
 	remove    chan EntryID
 	snapshot  chan chan []Entry
 	running   bool
+	logger    Logger
 	runningMu sync.Mutex
 	location  *time.Location
 	nextID    EntryID
@@ -31,6 +33,7 @@ func New(opts ...Option) *Cron {
 		remove:    make(chan EntryID),
 		snapshot:  make(chan chan []Entry),
 		running:   false,
+		logger:    DefaultLogger,
 		runningMu: sync.Mutex{},
 		location:  time.Local,
 	}
@@ -57,6 +60,7 @@ func (c *Cron) Start() {
 }
 
 func (c *Cron) run() {
+	c.logger.Info("start")
 	now := c.now()
 	for {
 		var timer *time.Timer
@@ -71,6 +75,9 @@ func (c *Cron) run() {
 		for {
 			select {
 			case now = <-timer.C:
+				now = now.In(c.location)
+				c.logger.Info("wake", "now", now)
+
 				for c.entries.Len() > 0 {
 					first := c.entries[0]
 					if first.Next.After(now) || first.Next.IsZero() {
@@ -78,26 +85,31 @@ func (c *Cron) run() {
 					}
 					first = heap.Pop(&c.entries).(*Entry)
 					c.startJob(first.WrappedJob, first.Payload)
+					c.logger.Info("run", "now", now, "entry", first.ID)
 				}
 
 			case newEntry := <-c.add:
 				timer.Stop()
 				now = c.now()
 				heap.Push(&c.entries, newEntry)
+				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
 			case replyChan := <-c.snapshot:
 				replyChan <- c.entrySnapshot()
 				continue
 			case <-c.stop:
 				timer.Stop()
+				c.logger.Info("stop")
 				return
 			case id := <-c.remove:
 				timer.Stop()
 				now = c.now()
 				c.removeEntry(id)
+				c.logger.Info("removed", "entry", id)
 			case entry := <-c.update:
 				timer.Stop()
 				now = c.now()
 				c.updateEntry(entry)
+				c.logger.Info("update", "entry", entry.ID)
 			}
 
 			break
@@ -202,6 +214,21 @@ func (c *Cron) Remove(id EntryID) {
 	}
 }
 
+func (c *Cron) Stop() context.Context {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if c.running {
+		c.stop <- struct{}{}
+		c.running = false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		c.jobWaiter.Wait()
+		cancel()
+	}()
+	return ctx
+}
+
 func (c *Cron) entrySnapshot() []Entry {
 	var entries = make([]Entry, len(c.entries))
 	for i, e := range c.entries {
@@ -255,9 +282,17 @@ type Entry struct {
 
 type EntryHeap []*Entry
 
-func (h EntryHeap) Len() int           { return len(h) }
-func (h EntryHeap) Less(i, j int) bool { return h[i].Next.Before(h[j].Next) }
-func (h EntryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h EntryHeap) Len() int { return len(h) }
+func (h EntryHeap) Less(i, j int) bool {
+	if h[i].Next.IsZero() {
+		return false
+	}
+	if h[j].Next.IsZero() {
+		return true
+	}
+	return h[i].Next.Before(h[j].Next)
+}
+func (h EntryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *EntryHeap) Push(x interface{}) {
 
 	*h = append(*h, x.(*Entry))

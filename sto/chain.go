@@ -3,6 +3,8 @@ package sto
 import (
 	"fmt"
 	"runtime"
+	"sync"
+	"time"
 )
 
 type JobWrapper func(Job, interface{}) Job
@@ -40,5 +42,41 @@ func Recover(logger Logger) JobWrapper {
 			j.Run(payload)
 		})
 
+	}
+}
+
+// DelayIfStillRunning serializes jobs, delaying subsequent runs until the
+// previous one is complete. Jobs running after a delay of more than a minute
+// have the delay logged at Info.
+func DelayIfStillRunning(logger Logger) JobWrapper {
+	return func(j Job, payload interface{}) Job {
+		var mu sync.Mutex
+		return FuncJob(func(payload interface{}) {
+			start := time.Now()
+			mu.Lock()
+			defer mu.Unlock()
+			if dur := time.Since(start); dur > time.Minute {
+				logger.Info("delay", "duration", dur)
+			}
+			j.Run(payload)
+		})
+	}
+}
+
+// SkipIfStillRunning skips an invocation of the Job if a previous invocation is
+// still running. It logs skips to the given logger at Info level.
+func SkipIfStillRunning(logger Logger) JobWrapper {
+	var ch = make(chan struct{}, 1)
+	ch <- struct{}{}
+	return func(j Job, payload interface{}) Job {
+		return FuncJob(func(payload interface{}) {
+			select {
+			case v := <-ch:
+				j.Run(payload)
+				ch <- v
+			default:
+				logger.Info("skip")
+			}
+		})
 	}
 }
